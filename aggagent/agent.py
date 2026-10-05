@@ -10,13 +10,14 @@ import litellm
 
 from .tools import (
     GetSolutionTool, GetSegmentTool,
-    SearchTrajectoriesTool, FinishTool,
+    SearchTrajectoriesTool, SearchToolOutputsTool, ReadToolOutputTool, FinishTool,
     format_metadata, _count_tokens_approx,
 )
 from .prompts import (
     SYSTEM_PROMPT_AGGAGENT, USER_PROMPT_AGGAGENT,
     SYSTEM_PROMPT_AGGAGENT_QWEN,
     SYSTEM_PROMPT_AGGAGENT_REPORT, USER_PROMPT_AGGAGENT_REPORT,
+    SYSTEM_PROMPT_VERIFY, USER_PROMPT_VERIFY,
     FINAL_MESSAGE,
 )
 
@@ -42,20 +43,33 @@ class AggAgent:
         max_context_tokens: int = 100 * 1024,
         task: str = "",
         llm_kwargs: dict | None = None,
+        mode: str = "aggregate",
     ):
         self.model = model
         self.api_base = api_base or ""
         self.max_context_tokens = max_context_tokens
         self.task = task
         self.llm_kwargs = llm_kwargs or {}
+        if mode not in ("aggregate", "verify"):
+            raise ValueError(f"mode must be 'aggregate' or 'verify', got {mode!r}")
+        self.mode = mode
 
-        variant = "long_form" if task in LONG_FORM_TASKS else ""
+        if mode == "verify":
+            variant = "verify"
+        else:
+            variant = "long_form" if task in LONG_FORM_TASKS else ""
         tools = [
             GetSolutionTool(),
             SearchTrajectoriesTool(),
             GetSegmentTool(),
             FinishTool(variant=variant, model=model),
         ]
+        if mode == "verify":
+            # Verification hinges on whether a value is literally present in an
+            # observation, and search_trajectory/get_segment truncate to 150/600 words.
+            # Only added here: giving aggregation new tools would change its baselines.
+            tools.append(SearchToolOutputsTool())
+            tools.append(ReadToolOutputTool())
 
         self.tool_map = {tool.name: tool for tool in tools}
         self.tool_description = [self.tool_map[t].get_tool_definitions() for t in self.tool_map]
@@ -78,6 +92,57 @@ class AggAgent:
         result = output.get("result")
         if result is None or not isinstance(result, dict) or "solution" not in result:
             return {"solution": None, "reason": None, "error": "Agent did not produce a valid solution"}
+        return result
+
+    def verify(self, question: str, trajectory: list[dict]) -> dict:
+        """
+        Check whether a trajectory's final answer is supported by its own tool observations.
+
+        Requires ``AggAgent(..., mode="verify")``. Verification is deliberately
+        single-trajectory: the point is to audit one answer's evidence chain, so the
+        agent is told ``trajectory_id`` is always 1 and that corroboration can only come
+        from raw tool output, never from agreement between trajectories. To weigh several
+        candidates against each other, use :meth:`run` (aggregation) instead.
+
+        Because the agent can only read the given trajectory — it cannot search the
+        web — this measures *evidence support*, not ground truth. A faithfully sourced
+        answer can still be wrong if the source itself was off-target, which is what
+        score 0 and the ``evidence`` field are for.
+
+        Args:
+            question: The task/question string.
+            trajectory: One trajectory, as a list of message dicts.
+
+        Returns:
+            On success::
+
+                {"support_score": float, # 0-1, how strongly observations establish the answer
+                 "label": str,           # band name for the score, for reading
+                 "verified_answer": str, # answer as re-derived from observations ("" if none)
+                 "evidence": str,        # the observations relied on, with step references
+                 "reason": str}
+
+            ``support_score`` is continuous, so it can rank candidates directly and any
+            pass/fail cut-off is the caller's to choose — 1.0 means fully established,
+            0.7-0.9 that only non-critical evidence is missing, 0.4-0.7 that an important
+            link is unverified, and 0.0 that the observations argue *against* the answer
+            (including refuting an intermediate claim it depends on). Missing evidence is
+            weighted by how necessary it is, not merely counted, so a long trajectory with
+            one unverifiable minor detail still scores high.
+
+            On failure: ``{"support_score": None, "error": str}``
+        """
+        if self.mode != "verify":
+            raise RuntimeError("verify() requires AggAgent(..., mode='verify')")
+        if trajectory and isinstance(trajectory[0], list):
+            raise TypeError(
+                "verify() takes a single trajectory (list of message dicts), not a list "
+                "of trajectories; pass trajectory[0] or use run() to aggregate several"
+            )
+        output = self._run(question, [{"messages": trajectory}])
+        result = output.get("result")
+        if result is None or not isinstance(result, dict) or "support_score" not in result:
+            return {"support_score": None, "error": "Agent did not produce a valid support_score"}
         return result
 
     # ------------------------------------------------------------------
@@ -174,7 +239,10 @@ class AggAgent:
         iteration = 0
         MAX_ITERATIONS = 100
 
-        if self.task in LONG_FORM_TASKS:
+        if self.mode == "verify":
+            system_prompt = SYSTEM_PROMPT_VERIFY
+            user_prompt = USER_PROMPT_VERIFY.format(question=question, metadata=metadata, traj_N=len(trajectories))
+        elif self.task in LONG_FORM_TASKS:
             system_prompt = SYSTEM_PROMPT_AGGAGENT_REPORT
             user_prompt = USER_PROMPT_AGGAGENT_REPORT.format(question=question, metadata=metadata, traj_N=len(trajectories))
         elif "qwen" in self.model.lower():
